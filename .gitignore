@@ -1,0 +1,9 @@
+@"
+web/.next
+web/node_modules
+api/dist
+api/node_modules
+*.log
+.DS_Store
+Thumbs.db
+"@ | Out-File -Encoding UTF8 .gitignore

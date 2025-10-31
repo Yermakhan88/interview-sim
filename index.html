@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="kk">
+<head>
+  <meta charset="utf-8" />
+  <title>AI Interview Simulator</title>
+  <style>
+    body{font-family:Arial,sans-serif;margin:30px}
+    button{font-size:18px;padding:10px 16px}
+    #status{margin-top:10px}
+    pre{background:#f4f4f4;padding:10px;border-radius:6px}
+  </style>
+</head>
+<body>
+  <h2>🎤 AI Interview Simulator (push-to-talk)</h2>
+
+  <p id="question">Сұрақ жүктелуде...</p>
+
+  <button id="micBtn">🎙️ Ұстаңыз және жауап беріңіз</button>
+  <div id="status">Статус: күтіп тұр...</div>
+
+  <h3>Нәтиже (транскрипт)</h3>
+  <pre id="transcript">—</pre>
+
+  <h3>AI кері байланыс</h3>
+  <pre id="feedback">—</pre>
+
+<script>
+const questions = [
+  "Сіздің жобаңыздың басты құндылығы қандай?",
+  "Нарықтағы бәсекелестерден қандай айырмашылығыңыз бар?",
+  "Қиын жағдайда жобаны қалай дамытасыз?",
+  "Командаңыздың мықты және әлсіз жақтары қандай?",
+  "Алғашқы жылы қандай нәтижеге жетесіз деп ойлайсыз?"
+];
+
+document.getElementById('question').innerText = questions[Math.floor(Math.random()*questions.length)];
+
+const micBtn = document.getElementById('micBtn');
+const status = document.getElementById('status');
+const transcriptEl = document.getElementById('transcript');
+const feedbackEl = document.getElementById('feedback');
+
+let mediaRecorder;
+let audioChunks = [];
+
+async function initStream(){
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+
+    mediaRecorder.ondataavailable = e => {
+      if(e.data && e.data.size > 0) audioChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = async () => {
+      status.innerText = 'Жазба дайын, серверге жіберілуде...';
+      const blob = new Blob(audioChunks, { type: 'audio/webm' });
+      audioChunks = [];
+
+      const fd = new FormData();
+      fd.append('audio', blob, 'recording.webm');
+
+      try {
+        const res = await fetch('/upload', { method: 'POST', body: fd });
+        const data = await res.json();
+        if(res.ok){
+          transcriptEl.innerText = data.transcript || '(транскрипт жоқ)';
+          feedbackEl.innerText = data.feedback || '(кері байланыс жоқ)';
+          status.innerText = 'Дайын.';
+        } else {
+          transcriptEl.innerText = '(қате)';
+          feedbackEl.innerText = data.error || JSON.stringify(data);
+          status.innerText = 'Қате: сервер жауап бермеді';
+        }
+      } catch(err){
+        status.innerText = 'Жіберу қатесі: ' + err.message;
+      }
+    };
+  } catch(err){
+    status.innerText = 'Микрофонға қосылу қатесі: ' + err.message;
+    micBtn.disabled = true;
+  }
+}
+
+initStream();
+
+// push-to-talk: mouse (және touch) events
+micBtn.onmousedown = () => {
+  if(!mediaRecorder) { status.innerText = 'Микрофон дайын емес'; return; }
+  audioChunks = [];
+  mediaRecorder.start();
+  status.innerText = '✅ Жазып жатыр... (батырманы босатқанша сөйлеңіз)';
+};
+micBtn.onmouseup = () => {
+  if(mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+};
+// touch support
+micBtn.ontouchstart = () => { if(mediaRecorder) { audioChunks=[]; mediaRecorder.start(); status.innerText='Жазу...'; } };
+micBtn.ontouchend = () => { if(mediaRecorder && mediaRecorder.state!=='inactive') mediaRecorder.stop(); };
+</script>
+</body>
+</html>
