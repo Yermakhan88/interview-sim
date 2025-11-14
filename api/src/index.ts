@@ -4,6 +4,118 @@ import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
 
+// ----------------------
+// AI-based soft skills analysis (OpenAI)
+// ----------------------
+type Metrics = { wpm: number; fillerCount: number };
+
+async function analyzeWithAI(
+  text: string,
+  languageCode: string,
+  metrics: Metrics,
+  question?: string
+) {
+  if (!process.env.OPENAI_API_KEY) {
+    console.warn('[ai] OPENAI_API_KEY missing, skipping AI analysis');
+    return null;
+  }
+
+  // Жауап тіліне қарай талдау тілін таңдаймыз
+  let lang: 'kk' | 'ru' | 'en' = 'en';
+  if (languageCode.startsWith('kk')) lang = 'kk';
+  else if (languageCode.startsWith('ru')) lang = 'ru';
+
+  const systemPrompt =
+    lang === 'kk'
+      ? 'Сен – soft skills (коммуникация, құрылым, сенімділік, релеванттық, қысқалық) бойынша сұхбат жауаптарын бағалайтын ассистентсің. Тек JSON форматында жауап бер.'
+      : lang === 'ru'
+      ? 'Ты ассистент по оценке soft skills (коммуникация, структура, уверенность, релевантность, лаконичность) в ответах на собеседовании. Отвечай строго в формате JSON.'
+      : 'You are an assistant that evaluates soft skills (communication, structure, confidence, relevance, conciseness) in interview answers. Reply strictly in JSON.';
+
+  const userPrompt = `
+Question:
+${question || '(no explicit question, free-form answer)'}
+
+Answer transcript:
+${text || '(empty)'}
+
+Basic metrics (from system):
+- Words per minute (WPM): ${metrics.wpm}
+- Filler words count: ${metrics.fillerCount}
+
+Task:
+1. Give an overall score (0–100) for this answer.
+2. Evaluate 5 aspects: communication, structure, confidence, relevance, conciseness.
+   For each aspect, give:
+   - score: integer 1–5
+   - comment: short comment in ${lang === 'kk' ? 'Kazakh' : lang === 'ru' ? 'Russian' : 'English'}.
+3. List 3–5 strengths (bulleted style).
+4. List 3–5 concrete improvement suggestions.
+5. Optionally, propose a short improved version outline (not full text, just structure).
+
+Return ONLY valid JSON with the following shape (no explanations, no markdown):
+
+{
+  "overallScore": 0,
+  "level": "beginner" | "intermediate" | "advanced",
+  "aspects": {
+    "communication": { "score": 0, "comment": "..." },
+    "structure": { "score": 0, "comment": "..." },
+    "confidence": { "score": 0, "comment": "..." },
+    "relevance": { "score": 0, "comment": "..." },
+    "conciseness": { "score": 0, "comment": "..." }
+  },
+  "strengths": ["...", "..."],
+  "improvements": ["...", "..."],
+  "outline": "Short outline text here"
+}
+`;
+
+  const body = {
+    model: 'gpt-4.1-mini',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt }
+    ],
+    response_format: { type: 'json_object' }
+  };
+
+  try {
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+
+    const data: any = await resp.json();
+
+    const raw =
+      data.choices?.[0]?.message?.content ||
+      data.choices?.[0]?.message?.content?.[0]?.text ||
+      '';
+
+    if (!raw) {
+      console.warn('[ai] empty AI content', JSON.stringify(data).slice(0, 300));
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed;
+    } catch (e) {
+      console.warn('[ai] failed to parse AI JSON:', e);
+      return { raw }; // ең болмағанда мәтін ретінде қайтару
+    }
+  } catch (e:any) {
+    console.error('[ai] request failed:', e?.message || e);
+    return null;
+  }
+}
+
+
 // ---- GOOGLE KEY to /tmp ----
 if (process.env.STT_PROVIDER === 'google' && process.env.GOOGLE_CLOUD_KEY) {
   const keyFile = path.join('/tmp', 'key.json');
@@ -53,53 +165,105 @@ function toWav16kIfNeeded(inputPath: string): Promise<string> {
 import { SpeechClient } from '@google-cloud/speech';
 const speechClient = new SpeechClient();
 
-async function transcribeGoogle(wavPath: string): Promise<string> {
+async function transcribeGoogle(wavPath: string, languageCode: string): Promise<string> {
   const audioBytes = fs.readFileSync(wavPath).toString('base64');
   if (!audioBytes) return '';
+
   const request = {
     audio: { content: audioBytes },
     config: {
       encoding: 'LINEAR16',
       sampleRateHertz: 16000,
-      languageCode: 'kk-KZ',
-      enableAutomaticPunctuation: true
-    }
+      languageCode,
+      enableAutomaticPunctuation: true,
+    },
   } as any;
-  const [resp] = await speechClient.recognize(request);
-  return (resp.results ?? [])
+
+  const [response] = await speechClient.recognize(request);
+  const text = (response.results ?? [])
     .map(r => r.alternatives?.[0]?.transcript ?? '')
     .join(' ')
     .trim();
+  return text || '';
 }
 
 // ---- Main endpoint ----
-app.post('/api/analyze', upload.single('audio'), async (req: Request, res: Response) => {
-  const t0 = Date.now();
-  try {
-    if (!req.file) return res.status(400).json({ error: 'audio missing' });
+const LANG_MAP: Record<string, string> = {
+  kk: 'kk-KZ',
+  ru: 'ru-RU',
+  en: 'en-US',
+};
 
+app.post('/api/analyze', upload.single('audio'), async (req: any, res: any) => {
+  const start = Date.now();
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'audio_missing' });
+    }
+
+    // 🔤 Тіл коды (frontend-тен lang келеді: kk / ru / en)
+    const langKey = (req.body?.lang || 'kk').toLowerCase();
+    const languageCode = LANG_MAP[langKey] || 'kk-KZ';
+
+    // 🎧 Файлды WAV 16kHz-қа түрлендіру
     let wavPath: string;
     try {
       wavPath = await toWav16kIfNeeded(req.file.path);
       const st = fs.statSync(wavPath);
-      if (!st.size) return res.status(400).json({ error: 'empty_audio', detail: 'Converted WAV is empty' });
+      if (!st.size) {
+        return res.status(400).json({
+          error: 'empty_audio',
+          detail: 'Converted WAV is empty'
+        });
+      }
     } catch (e: any) {
-      return res.status(500).json({ error: 'ffmpeg conversion failed', detail: String(e?.message || e) });
+      return res.status(500).json({
+        error: 'ffmpeg_failed',
+        detail: String(e?.message || e),
+      });
     }
 
+    // 🧠 Google STT
     let text = '';
     try {
-      text = await transcribeGoogle(wavPath);
+      // егер transcribeGoogle тіл параметрін қабылдаса:
+      text = await transcribeGoogle(wavPath, languageCode);
+      // егер бір ғана параметр болса, онда:
+      // text = await transcribeGoogle(wavPath);
     } catch (e: any) {
-      return res.status(500).json({ error: 'google stt failed', detail: String(e?.message || e) });
+      return res.status(500).json({
+        error: 'stt_failed',
+        detail: String(e?.message || e),
+      });
     }
 
+    const metrics = simpleMetrics(text);
+
+    // Frontend-тен келетін сұрақ (page.tsx ішінде fd.append('question', currentQuestion); болса)
+    const question: string | undefined = req.body?.question;
+
+    // 🔥 Жасанды интеллект арқылы терең Soft Skills бағасы
+    const aiFeedback = await analyzeWithAI(text, languageCode, metrics, question);
+
+    // 🧹 Временный файлдарды тазалау
     try { if (wavPath !== req.file.path) fs.unlinkSync(wavPath); } catch {}
     try { fs.unlinkSync(req.file.path); } catch {}
 
-    return res.json({ text, metrics: simpleMetrics(text), took_ms: Date.now() - t0 });
+    // ✅ Финалдық жауап
+    return res.json({
+      text,
+      languageCode,
+      metrics,       // WPM, fillers, tips
+      aiFeedback,    // ЖИ талдауы (overallScore, strengths, improvements...)
+      took_ms: Date.now() - start
+    });
   } catch (e: any) {
-    return res.status(500).json({ error: 'unexpected', detail: String(e?.message || e) });
+    console.error('analyze_error:', e);
+    return res.status(500).json({
+      error: 'unexpected',
+      detail: String(e?.message || e),
+    });
   }
 });
 
@@ -114,6 +278,71 @@ function simpleMetrics(text: string) {
   if (wpm > 180) tips.push('Қарқынды баяулатыңыз.');
   if (wpm < 80) tips.push('Сөйлеуді сәл жылдамдатыңыз.');
   return { wpm, fillerCount, tips };
+}
+
+type Metrics = { wpm: number; fillerCount: number };
+
+function analyzeSoftSkills(text: string, metrics: Metrics) {
+  const wordCount = text.trim() ? text.trim().split(/\s+/).length : 0;
+
+  const soft = {
+    communication: { score: 0, comment: '' },
+    structure: { score: 0, comment: '' },
+    confidence: { score: 0, comment: '' },
+    relevance: { score: 0, comment: '' },
+    conciseness: { score: 0, comment: '' },
+  };
+
+  // Communication clarity
+  if (!text) {
+    soft.communication = { score: 1, comment: 'Жауап анық емес немесе жоқ.' };
+  } else if (wordCount < 5) {
+    soft.communication = { score: 2, comment: 'Жауап тым қысқа, ой толық ашылмаған.' };
+  } else if (wordCount < 40) {
+    soft.communication = { score: 4, comment: 'Жауап қысқа, бірақ салыстырмалы түрде түсінікті.' };
+  } else {
+    soft.communication = { score: 5, comment: 'Жауап жеткілікті толық және түсінікті.' };
+  }
+
+  // Structure
+  const hasConnectors = /сондықтан|сонымен қатар|во-первых|во-вторых|итог/i.test(text);
+  if (!text) {
+    soft.structure = { score: 1, comment: 'Құрылым байқалмайды.' };
+  } else if (hasConnectors) {
+    soft.structure = { score: 4, comment: 'Жауапта логикалық жалғаушы сөздер бар.' };
+  } else {
+    soft.structure = { score: 3, comment: 'Жауап бар, бірақ құрылымы айқын емес.' };
+  }
+
+  // Confidence
+  if (metrics.wpm < 70) {
+    soft.confidence = { score: 2, comment: 'Сөйлеу қарқыны баяу, сенімсіздік болуы мүмкін.' };
+  } else if (metrics.wpm > 190 || metrics.fillerCount > 7) {
+    soft.confidence = { score: 3, comment: 'Толтырма сөздер көп немесе жылдамдық тым жоғары.' };
+  } else {
+    soft.confidence = { score: 4, comment: 'Сөйлеу қарқыны жеткілікті, сенімділік жақсы.' };
+  }
+
+  // Relevance
+  const relevanceHints = /(университет|факультет|жұмыс|команда|студент|teacher|оқу)/i.test(text);
+  if (!text) {
+    soft.relevance = { score: 1, comment: 'Сұраққа жауап жоқ.' };
+  } else if (relevanceHints) {
+    soft.relevance = { score: 4, comment: 'Жауап тақырыпқа жақсы сәйкес келеді.' };
+  } else {
+    soft.relevance = { score: 3, comment: 'Жауап бар, бірақ сұрақпен байланысы әлсіз.' };
+  }
+
+  // Conciseness
+  if (wordCount < 5) {
+    soft.conciseness = { score: 2, comment: 'Жауап тым қысқа.' };
+  } else if (wordCount > 160) {
+    soft.conciseness = { score: 3, comment: 'Жауап тым ұзын, негізгі ойды қысқартуға болады.' };
+  } else {
+    soft.conciseness = { score: 4, comment: 'Жауап көлемі тиімді.' };
+  }
+
+  return soft;
 }
 
 const PORT = process.env.PORT || 3000;
