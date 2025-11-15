@@ -5,6 +5,9 @@
     "moduleResolution": "Node",
     "outDir": "dist",
     "rootDir": "src",
+
+    "lib": ["ES2019", "DOM"],
+
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
@@ -12,3 +15,4 @@
   },
   "include": ["src/**/*"]
 }
+

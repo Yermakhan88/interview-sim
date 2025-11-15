@@ -3,12 +3,40 @@ import cors from 'cors';
 import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
+import ffmpeg from 'fluent-ffmpeg';
+import ffmpegPath from 'ffmpeg-static';
+import { SpeechClient } from '@google-cloud/speech';
 
 // ----------------------
-// AI-based soft skills analysis (OpenAI)
+// Types
 // ----------------------
-type Metrics = { wpm: number; fillerCount: number };
+type Metrics = { wpm: number; fillerCount: number; tips?: string[] };
 
+interface SoftAspect {
+  score: number;
+  comment: string;
+}
+
+interface SoftSkills {
+  communication: SoftAspect;
+  structure: SoftAspect;
+  confidence: SoftAspect;
+  relevance: SoftAspect;
+  conciseness: SoftAspect;
+}
+
+// ----------------------
+// Language map
+// ----------------------
+const LANG_MAP: Record<string, string> = {
+  kk: 'kk-KZ',
+  ru: 'ru-RU',
+  en: 'en-US',
+};
+
+// ----------------------
+// AI-based Soft Skills Analysis (OpenAI)
+// ----------------------
 async function analyzeWithAI(
   text: string,
   languageCode: string,
@@ -93,8 +121,8 @@ Return ONLY valid JSON with the following shape (no explanations, no markdown):
     const data: any = await resp.json();
 
     const raw =
-      data.choices?.[0]?.message?.content ||
-      data.choices?.[0]?.message?.content?.[0]?.text ||
+      data?.choices?.[0]?.message?.content ||
+      data?.choices?.[0]?.message?.content?.[0]?.text ||
       '';
 
     if (!raw) {
@@ -109,14 +137,15 @@ Return ONLY valid JSON with the following shape (no explanations, no markdown):
       console.warn('[ai] failed to parse AI JSON:', e);
       return { raw }; // ең болмағанда мәтін ретінде қайтару
     }
-  } catch (e:any) {
+  } catch (e: any) {
     console.error('[ai] request failed:', e?.message || e);
     return null;
   }
 }
 
-
-// ---- GOOGLE KEY to /tmp ----
+// ----------------------
+// GOOGLE KEY to /tmp
+// ----------------------
 if (process.env.STT_PROVIDER === 'google' && process.env.GOOGLE_CLOUD_KEY) {
   const keyFile = path.join('/tmp', 'key.json');
   try {
@@ -128,41 +157,47 @@ if (process.env.STT_PROVIDER === 'google' && process.env.GOOGLE_CLOUD_KEY) {
   }
 }
 
+// ----------------------
+// Express app
+// ----------------------
 const app = express();
 
-// ---- CORS (wide during dev) ----
+// CORS (кең, dev үшін)
 app.use(cors({ origin: (_o, cb) => cb(null, true) }));
 app.options('*', cors());
 
-// ---- Health ----
+// Healthcheck
 app.get('/healthz', (_req: Request, res: Response) => res.send('ok'));
 
-// ---- Upload to /tmp ----
+// Upload to /tmp
 const upload = multer({
   dest: '/tmp',
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
-// ---- FFmpeg setup ----
-import ffmpeg from 'fluent-ffmpeg';
-import ffmpegPath from 'ffmpeg-static';
+// ----------------------
+// FFmpeg setup
+// ----------------------
 ffmpeg.setFfmpegPath((ffmpegPath as unknown as string) || 'ffmpeg');
 
 function toWav16kIfNeeded(inputPath: string): Promise<string> {
   const outPath = inputPath.toLowerCase().endsWith('.wav') ? inputPath : inputPath + '.wav';
   return new Promise((resolve, reject) => {
-    const chain = inputPath === outPath
-      ? ffmpeg(inputPath)
-      : ffmpeg(inputPath).audioCodec('pcm_s16le').audioFrequency(16000).format('wav');
+    const chain =
+      inputPath === outPath
+        ? ffmpeg(inputPath)
+        : ffmpeg(inputPath).audioCodec('pcm_s16le').audioFrequency(16000).format('wav');
 
-    chain.on('end', () => resolve(outPath))
-         .on('error', reject)
-         .save(outPath);
+    chain
+      .on('end', () => resolve(outPath))
+      .on('error', reject)
+      .save(outPath);
   });
 }
 
-// ---- Google STT (clean import) ----
-import { SpeechClient } from '@google-cloud/speech';
+// ----------------------
+// Google Speech-to-Text
+// ----------------------
 const speechClient = new SpeechClient();
 
 async function transcribeGoogle(wavPath: string, languageCode: string): Promise<string> {
@@ -187,105 +222,30 @@ async function transcribeGoogle(wavPath: string, languageCode: string): Promise<
   return text || '';
 }
 
-// ---- Main endpoint ----
-const LANG_MAP: Record<string, string> = {
-  kk: 'kk-KZ',
-  ru: 'ru-RU',
-  en: 'en-US',
-};
-
-app.post('/api/analyze', upload.single('audio'), async (req: any, res: any) => {
-  const start = Date.now();
-
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'audio_missing' });
-    }
-
-    // 🔤 Тіл коды (frontend-тен lang келеді: kk / ru / en)
-    const langKey = (req.body?.lang || 'kk').toLowerCase();
-    const languageCode = LANG_MAP[langKey] || 'kk-KZ';
-
-    // 🎧 Файлды WAV 16kHz-қа түрлендіру
-    let wavPath: string;
-    try {
-      wavPath = await toWav16kIfNeeded(req.file.path);
-      const st = fs.statSync(wavPath);
-      if (!st.size) {
-        return res.status(400).json({
-          error: 'empty_audio',
-          detail: 'Converted WAV is empty'
-        });
-      }
-    } catch (e: any) {
-      return res.status(500).json({
-        error: 'ffmpeg_failed',
-        detail: String(e?.message || e),
-      });
-    }
-
-    // 🧠 Google STT
-    let text = '';
-    try {
-      // егер transcribeGoogle тіл параметрін қабылдаса:
-      text = await transcribeGoogle(wavPath, languageCode);
-      // егер бір ғана параметр болса, онда:
-      // text = await transcribeGoogle(wavPath);
-    } catch (e: any) {
-      return res.status(500).json({
-        error: 'stt_failed',
-        detail: String(e?.message || e),
-      });
-    }
-
-    const metrics = simpleMetrics(text);
-
-    // Frontend-тен келетін сұрақ (page.tsx ішінде fd.append('question', currentQuestion); болса)
-    const question: string | undefined = req.body?.question;
-
-    // 🔥 Жасанды интеллект арқылы терең Soft Skills бағасы
-    const aiFeedback = await analyzeWithAI(text, languageCode, metrics, question);
-
-    // 🧹 Временный файлдарды тазалау
-    try { if (wavPath !== req.file.path) fs.unlinkSync(wavPath); } catch {}
-    try { fs.unlinkSync(req.file.path); } catch {}
-
-    // ✅ Финалдық жауап
-    return res.json({
-      text,
-      languageCode,
-      metrics,       // WPM, fillers, tips
-      aiFeedback,    // ЖИ талдауы (overallScore, strengths, improvements...)
-      took_ms: Date.now() - start
-    });
-  } catch (e: any) {
-    console.error('analyze_error:', e);
-    return res.status(500).json({
-      error: 'unexpected',
-      detail: String(e?.message || e),
-    });
-  }
-});
-
-function simpleMetrics(text: string) {
+// ----------------------
+// Simple metrics & эвристика
+// ----------------------
+function simpleMetrics(text: string): Metrics {
   const words = text.trim() ? text.trim().split(/\s+/) : [];
   const fillers = ['ээ', 'мм', 'ну', 'ой', 'uh', 'um', 'like', 'you know'];
   const fillerCount = words.filter(w => fillers.includes(w.toLowerCase())).length;
+
+  // Қазірше жауапты шамамен 0.5 минут деп аламыз → жуық wpm
   const wpm = Math.round(words.length / 0.5);
+
   const tips: string[] = [];
   if (!text) tips.push('Микрофон/форматпен мәселе болуы мүмкін.');
   if (fillerCount > 3) tips.push('Толтырма сөздерді азайтыңыз.');
   if (wpm > 180) tips.push('Қарқынды баяулатыңыз.');
-  if (wpm < 80) tips.push('Сөйлеуді сәл жылдамдатыңыз.');
+  if (wpm < 80 && words.length > 0) tips.push('Сөйлеуді сәл жылдамдатыңыз.');
+
   return { wpm, fillerCount, tips };
 }
 
-type Metrics = { wpm: number; fillerCount: number };
-
-function analyzeSoftSkills(text: string, metrics: Metrics) {
+function analyzeSoftSkills(text: string, metrics: Metrics): SoftSkills {
   const wordCount = text.trim() ? text.trim().split(/\s+/).length : 0;
 
-  const soft = {
+  const soft: SoftSkills = {
     communication: { score: 0, comment: '' },
     structure: { score: 0, comment: '' },
     confidence: { score: 0, comment: '' },
@@ -345,5 +305,88 @@ function analyzeSoftSkills(text: string, metrics: Metrics) {
   return soft;
 }
 
+// ----------------------
+// Main endpoint
+// ----------------------
+app.post('/api/analyze', upload.single('audio'), async (req: any, res: any) => {
+  const start = Date.now();
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'audio_missing' });
+    }
+
+    const langKey = (req.body?.lang || 'kk').toLowerCase();
+    const languageCode = LANG_MAP[langKey] || 'kk-KZ';
+
+    // 1) WAV 16kHz-ке конвертация
+    let wavPath: string;
+    try {
+      wavPath = await toWav16kIfNeeded(req.file.path);
+      const st = fs.statSync(wavPath);
+      if (!st.size) {
+        return res.status(400).json({ error: 'empty_audio' });
+      }
+    } catch (e: any) {
+      console.error('[ffmpeg] error:', e);
+      return res.status(500).json({ error: 'ffmpeg_failed', detail: e.message });
+    }
+
+    // 2) Google STT
+    let text = '';
+    try {
+      text = await transcribeGoogle(wavPath, languageCode);
+    } catch (e: any) {
+      console.error('[stt] error:', e);
+      return res.status(500).json({ error: 'stt_failed', detail: e.message });
+    }
+
+    // 3) Метрикалар
+    const metrics = simpleMetrics(text);
+
+    // 4) Эвристикалық Soft Skills
+    const softSkills = analyzeSoftSkills(text, metrics);
+
+    // 5) Frontend-тен келген сұрақ
+    const question: string | undefined = req.body?.question;
+
+    // 6) ЖИ арқылы терең Soft Skills бағалау
+    let aiFeedback: any = null;
+    try {
+      aiFeedback = await analyzeWithAI(text, languageCode, metrics, question);
+    } catch (e: any) {
+      console.error('[ai] analyzeWithAI failed:', e?.message || e);
+      aiFeedback = { error: 'ai_failed', detail: e?.message || String(e) };
+    }
+
+    // 7) Уақытша файлдарды тазалау
+    try {
+      if (wavPath !== req.file.path) fs.unlinkSync(wavPath);
+    } catch {}
+    try {
+      fs.unlinkSync(req.file.path);
+    } catch {}
+
+    // 8) Финалдық JSON (frontend дәл осыны күтеді)
+    return res.json({
+      text,
+      languageCode,
+      metrics,     // { wpm, fillerCount, tips }
+      softSkills,  // эвристика
+      aiFeedback,  // OpenAI анализі
+      took_ms: Date.now() - start
+    });
+  } catch (e: any) {
+    console.error('analyze_error:', e);
+    return res.status(500).json({
+      error: 'unexpected',
+      detail: String(e?.message || e),
+    });
+  }
+});
+
+// ----------------------
+// Start server
+// ----------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API on :${PORT}`));
